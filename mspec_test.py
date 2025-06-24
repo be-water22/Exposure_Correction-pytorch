@@ -95,5 +95,129 @@ if __name__ == '__main__':
 		calculate_psnr_ssim(savedir,gtimg_dir)
 
 
-		
+"""
+'''@Author: LZ-CH
+@Contact: 2443976970@qq.com
+Note: this repository could only be used when CUDA is available!!!
+'''
 
+import os
+import time
+environment = os.environ
+environment['CUDA_VISIBLE_DEVICES'] = '0'
+
+import cv2
+import glob
+import torch
+import numpy as np
+from model import MSPEC_Net
+from tools.decomposition import lplas_decomposition as decomposition
+from tools.calculate_psnr_ssim import calculate_psnr_ssim
+
+# Import BGU upsampling utilities
+from bgu import compute_bgu, rgb2luminance
+
+# --- Configuration ---
+IN_SIZE = 512   # patch size for network input
+BGU_THRESH = IN_SIZE  # use BGU if max dimension > this
+
+
+def exposure_correction(mspec_net, img):
+    
+    # Perform exposure correction at a fixed resolution patch.
+    # Input: img as HxWxC float in [0,1] or uint8.
+    # Returns: corrected image at same size.
+    
+    if img.dtype == np.uint8:
+        img = img.astype(np.float32) / 255.0
+
+    _, L_list = decomposition(img)
+    # Prepare pyramid tensors
+    L_list = [torch.from_numpy(l).float().permute(2,0,1).unsqueeze(0).cuda()
+              for l in L_list]
+    # Network prediction
+    Y_list = mspec_net(L_list)
+    out = Y_list[-1].squeeze().permute(1,2,0).detach().cpu().numpy()
+    return out
+
+
+def down_correction(mspec_net, img):
+    
+    # Downscale large inputs to IN_SIZE, apply exposure correction, then upsample
+    # using BGU if high-res, otherwise simple resize.
+    
+    h, w = img.shape[:2]
+    max_dim = max(h, w)
+    scale = IN_SIZE / max_dim
+
+    # Low-res input
+    img_low = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+    # Pad to square resolution IN_SIZE x IN_SIZE
+    top_pad = IN_SIZE - img_low.shape[0]
+    left_pad = IN_SIZE - img_low.shape[1]
+    img_padded = cv2.copyMakeBorder(img_low, top_pad, 0, left_pad, 0,
+                                    cv2.BORDER_REFLECT)
+
+    # Exposure correction at low-res
+    corrected = exposure_correction(mspec_net, img_padded)
+    # Crop back
+    corrected = corrected[top_pad:, left_pad:, :]
+
+    # If image is large, apply BGU guided upsampling
+    if max_dim > BGU_THRESH:
+        # Normalize to float64 in [0,1]
+        I_lr = img_low.astype(np.float64) / 255.0
+        O_lr = corrected.astype(np.float64)
+        I_hr = img.astype(np.float64) / 255.0
+
+        # compute BGU result
+        bgu_res = compute_bgu(
+            I_lr, rgb2luminance(I_lr),
+            O_lr, None,
+            I_hr, rgb2luminance(I_hr)
+        )
+        upsampled = bgu_res['result_fs']
+    else:
+        # simple interpolation
+        upsampled = cv2.resize(corrected, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    # Convert back to uint8
+    out_uint8 = np.clip(upsampled*255.0, 0, 255).astype(np.uint8)
+    return out_uint8
+
+
+def evaluate(mspec_net, image_path, save_dir):
+    img = cv2.imread(image_path)
+    start = time.time()
+    out = down_correction(mspec_net, img)
+    elapsed = time.time() - start
+    print(f"Processed {os.path.basename(image_path)} in {elapsed:.2f}s")
+
+    os.makedirs(save_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(save_dir, os.path.basename(image_path)), out)
+
+
+if __name__ == '__main__':
+    print('------- begin test --------')
+    # load network
+    net = MSPEC_Net().cuda()
+    net = torch.nn.DataParallel(net)
+    net.load_state_dict(torch.load('./snapshots/MSPECnet_woadv.pth'))
+    net.eval()
+
+    input_dir = './MultiExposure_dataset/testing/INPUT_IMAGES'
+    gt_dir    = './MultiExposure_dataset/testing/expert_c_testing_set'
+    output_dir= './MultiExposure_dataset/testing/eval_output_bgu'
+
+    img_list = sorted(glob.glob(os.path.join(input_dir, '*')))
+
+    with torch.no_grad():
+        for idx, path in enumerate(img_list, 1):
+            evaluate(net, path, output_dir)
+            if idx % 50 == 0:
+                print(f"{idx} images done")
+
+    # compute metrics
+    calculate_psnr_ssim(output_dir, gt_dir)
+
+"""
